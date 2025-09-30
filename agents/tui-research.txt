@@ -1,0 +1,134 @@
+Raxol – Termbox2 NIF + OTP Architecture: Raxol embeds a Termbox2 driver as an Erlang NIF and wraps it in an OTP framework. It includes a sub-application (:termbox2_nif) that loads a C library (Termbox2) via :erlang.load_nif on startup
+GitHub
+. This NIF exposes functions mirroring the Termbox API – e.g. tb_init/0, tb_shutdown/0, tb_width/0, tb_set_cell/5, tb_present/0, etc. – which call the underlying C functions for initializing the terminal, writing cells to the off-screen buffer, and flushing to the screen
+GitHub
+GitHub
+. Raxol’s rendering pipeline uses Termbox’s double-buffer: the library’s Integration Renderer iterates over each cell of the screen and invokes :termbox2_nif.tb_set_cell(x,y,ch,fg,bg) for it
+GitHub
+GitHub
+, then calls tb_present() to swap buffers and display the frame
+GitHub
+. (It even extends Termbox2 with extras like setting the terminal title, via custom NIF functions
+GitHub
+GitHub
+.) Raxol maintains its own ScreenBuffer abstraction in Elixir to track drawn content, but ultimately rendering is done by populating Termbox’s buffer and presenting it.
+
+On the process model, Raxol is heavily process-oriented. It runs a Terminal Driver as a GenServer that manages low-level terminal I/O and events
+GitHub
+. On startup, this driver GenServer puts the terminal in raw mode by calling :termbox2_nif.tb_init()
+GitHub
+ and saves original TTY settings. Input events are captured (Raxol’s NIF likely starts an internal polling thread or uses select() on STDIN) and forwarded to the driver as messages {:termbox_event, map}
+GitHub
+. The driver translates these into higher-level events and sends them to a central Dispatcher process
+GitHub
+GitHub
+. Meanwhile, a Rendering Engine GenServer runs in parallel: it holds the current UI state (the “virtual DOM” or model) and on demand renders the UI to a buffer. Raxol’s application supervisor starts these pieces – e.g. the Dispatcher, RenderingEngine, etc. – under a supervision tree
+GitHub
+GitHub
+. The Dispatcher (another GenServer) holds the app’s state/model and receives events from the Terminal Driver, updates state, and triggers re-renders. The RenderingEngine then computes a new list of cells (with layouts, styling, etc.) and uses the Termbox NIF to draw them. (Notably, Raxol’s Rendering.Engine can either call the NIF directly or produce ANSI strings for certain environments – it has a “unified renderer” capable of outputting styled text
+GitHub
+, though in a normal TUI it uses the NIF path.) In short, Raxol integrates Termbox2 via a NIF and orchestrates it with multiple OTP processes (supervised GenServers) for event handling and rendering. This design provides isolation (input, state logic, and drawing each run in separate processes) and makes it straightforward to build higher-level components: Raxol treats the UI as a pure function of state (à la Elm/React). The user defines a view(model) that returns a tree of UI elements, and Raxol’s layout engine computes how to render that to cells
+GitHub
+GitHub
+. Those cells are then blitted to the terminal via the NIF. Components in Raxol are therefore just Elixir data structures/functions – there isn’t a process per widget, but the framework’s architecture (Dispatcher + RenderingEngine + plugin system) lets you modularize the UI and even plug in behaviors (e.g. custom theming or event hooks) in a maintainable way. All of this is built on the low-level NIF calls which ensure rendering and input are efficient (native code) while the Elixir processes manage the rest of the app’s state and supervision.
+
+Ratatouille – ex_termbox NIF + Elm-like Loop: Ratatouille uses Termbox via an external library, ExTermbox, and pairs it with an Elm-style runtime. The ex_termbox dependency provides a set of NIF bindings for the classic Termbox API (Termbox 1.0). For example, ExTermbox.Bindings.init/0 and shutdown/0 call tb_init()/tb_shutdown() in C, width/0 and height/0 query the terminal size, clear/0 clears the back buffer, change_cell(x,y,ch,fg,bg) writes a character cell, and present/0 flushes the buffer. (The NIF also implements poll_event(timeout) which blocks on input – the ExTermbox changelog notes fixes to event polling reliability
+GitHub
+.) Ratatouille does not embed its own C code; it simply calls these ExTermbox functions. For rendering, Ratatouille’s core idea is to reduce the UI to a Canvas and then blit it in one go. Each time your app’s state changes, the framework performs: (1) Bindings.clear() to clear Termbox’s off-screen buffer, (2) traverse your declared view (a tree of UI elements defined with Ratatouille’s DSL) and draw it onto an in-memory %Canvas{} (this involves layout calculation, wrapping text, etc.), and (3) iterate over the canvas cells to call Bindings.change_cell(...) or put_cell for each cell, thereby updating Termbox’s buffer, then (4) call Bindings.present() to render to the terminal
+GitHub
+GitHub
+. All drawing in a frame happens inside a single Window GenServer call, ensuring the UI is updated atomically. This approach (clear -> draw -> present) effectively double-buffers via Termbox and avoids flicker or partial updates.
+
+In Ratatouille’s design, the Window is a GenServer that encapsulates these NIF calls. When you call Ratatouille.Window.update(view), internally the Window server handles a {:update, view} message: it clears the screen, renders the view to the buffer, and presents it before replying
+GitHub
+GitHub
+. The Window process was started with ExTermbox.init() already called in its init/1 (it also sets Termbox input/output modes)
+GitHub
+, and it traps exits to ensure that on shutdown it calls Bindings.shutdown() to restore the terminal state
+GitHub
+. Input handling is delegated to ExTermbox’s built-in EventManager process. When the app starts, Ratatouille’s supervisor launches ExTermbox.EventManager.start_link() (wrapped by Ratatouille.EventManager, which just delegates to the NIF library’s manager)
+GitHub
+GitHub
+. This EventManager GenServer likely calls the NIF poll_event in a loop (possibly running in a dirty scheduler or separate thread) and upon each key press, mouse event, or resize, it broadcasts an {:event, event_map} message to all subscribers (the Ratatouille runtime will subscribe). The Runtime itself is implemented as a simple Task process running an infinite receive loop (this is the “Elm-like” part). It subscribes to the EventManager, then calls the user’s init function to get the initial model
+GitHub
+GitHub
+. Thereafter it enters a loop: it renders the current model via Window.update(view) on each iteration
+GitHub
+, then waits for messages. When an input event arrives ({:event, e}), the runtime process invokes the user’s update(model, {:event, e}) callback to get a new model (and any commands)
+GitHub
+GitHub
+. It then loops again, causing the UI to redraw. A special case is made for Termbox resize events and for quit keystrokes (e.g. by default, “q” or Ctrl+C are mapped to exit) – the runtime will detect those and gracefully terminate the loop or shut down the supervisor
+GitHub
+. Ratatouille’s supervision tree (see Ratatouille.Runtime.Supervisor) ties these pieces together: it starts the Window, the EventManager, and the Runtime task as children, typically with a one_for_all strategy
+GitHub
+GitHub
+. This way if the Window or EventManager crashes, the whole app is restarted (important because losing the Window means the terminal might be left in raw mode – the supervised shutdown ensures tb_shutdown() is called). Overall, Ratatouille uses the NIF primarily for fast drawing and input, but leans on Elixir processes to structure the app. State is held in the runtime loop (just one process updating a model record), and there isn’t a separate process per UI component – instead, components are declarative. Developers build UIs using an HTML-like DSL (e.g. panel(title: "Title") do ... end, with nested table, label, etc.), which under the hood are just data structures processed by the Renderer. This makes it easy to compose interfaces, but all components render through the single Window buffer each frame. If you need independent interactive components, you manage that in your update function logic (or by using the subscriptions feature to handle periodic events or external messages in the loop). In summary, Ratatouille integrates with Termbox via a dedicated NIF library and uses a supervised GenServer + event-loop pattern to manage the TUI. The result is a robust architecture (thanks to OTP supervision and the Elm-like separation of model, view, update) built on top of efficient native terminal operations.
+
+ElementTui – Termbox2 NIF + Manual Render Loop: ElementTui also binds to Termbox2 via a native NIF, but takes a more lightweight, callback-oriented approach to TUI management. The library bundles Termbox2 in its source (e.g. src/termbox2_nif.c and termbox2.h) and loads it similarly to Raxol (on application start, :erlang.load_nif is called – likely in ElementTui.TUI module or so). This exposes functions like ElementTui.width/0, height/0 (which call tb_width/0 and tb_height/0 in C), ElementTui.clear/0 and present/0, and probably a poll_event or similar behind the scenes. The README explicitly states it uses “termbox2 under the hood.”
+preview.hex.pm
+ Once initialized, ElementTui does not spin up a fleet of processes – instead, it gives you a single-call entry point: ElementTui.run_loop(callback, initial_state, opts). This function wraps the core event loop for your terminal UI. Internally, run_loop/3 will call the NIF init (turning the terminal to raw mode) and then continuously wait for input events, feeding them to your provided callback. You can see in the example that run_loop calls the anonymous function for each event (or each tick timeout) with the current state and an event term ev
+preview.hex.pm
+. Your function then decides how to react: in the example, if the event is {:key, _, _, ?q} (meaning a keypress “q”), the callback returns {:halt, nil} to break the loop and exit
+preview.hex.pm
+. Otherwise (for any other event or a timeout), the callback renders a frame: it constructs some UI elements (e.g. a text or a layout of two panes) and calls ElementTui.render(x, y, width, height, elements) to draw them in the off-screen buffer
+preview.hex.pm
+preview.hex.pm
+, then calls ElementTui.present() to flush changes to the terminal
+preview.hex.pm
+. Finally it returns {:cont, new_state} (in the examples, new_state is just nil since they aren’t keeping any mutable state between frames) to continue the loop
+preview.hex.pm
+. This pattern is very much like a simple game loop or a :gen_server receive loop coded by hand: under the hood the library likely does something like:
+
+:ok = ElementTui.TUI.init() 
+state = initial_state
+repeat 
+   ev = ElementTui.TUI.poll_event(timeout)   # (native call, blocking with timeout)
+   case callback.(state, ev) do 
+      {:cont, new_state} -> 
+           # (your callback calls render() & present() as needed)
+           state = new_state 
+           loop again
+      {:halt, final_state} -> 
+           :ok = ElementTui.TUI.shutdown() 
+           return final_state 
+   end
+
+
+The Termbox2 NIF handles the blocking poll_event call. Likely, it either uses a dirty scheduler thread or spawns a C thread so that the BEAM isn’t stalled while waiting for keys. (Because ElementTui is designed to be used in scripts or simple apps, it’s possible the NIF just blocks the current process on tb_poll_event(timeout) – which is acceptable as long as you don’t need that process to do other work. The library’s documentation advises running with --noinput so that the BEAM doesn’t interfere with STDIN
+preview.hex.pm
+.) In any case, ElementTui doesn’t create a separate Elixir process for event polling; it uses the calling process’s loop to handle events synchronously.
+
+Rendering in ElementTui is also done synchronously in that loop. The library provides an Element module with functions to create and compose UI components in a functional, immediate style. For instance, ElementTui.Element.text("Hello") produces a text element; Element.wrap(element) might turn a primitive into a container; Element.hbox([elem1, elem2, ...]) lays out children in a horizontal box, etc.
+preview.hex.pm
+preview.hex.pm
+. These calls don’t render anything by themselves – they build up a nested description of the UI (much like Ratatouille’s DSL, but likely using plain functions rather than macros). When you call ElementTui.render(x, y, w, h, element_tree), the library takes that description and computes the layout within the given rectangle (x,y – width x height). It will calculate, for example, how to split space between an hbox’s children, how to wrap/fill text, and so on. During this traversal, it issues NIF calls to actually draw each visible character cell. We don’t have the source here, but conceptually it would use something like :termbox2_nif.tb_set_cell(...) for each character of each element. (Since Termbox2 supports 24-bit color, presumably ElementTui’s Element.style/2 or text elements can carry RGB or attribute info, which the NIF uses as fg/bg values.) After render has walked the whole element tree and drawn into Termbox’s back-buffer, the call to present() pushes it to screen. The examples show the user explicitly calling ElementTui.present() after rendering – giving developers control over double-buffering (you could render multiple sub-components then present once at the end of the frame). This is similar to Raxol’s approach in integration mode. The key difference is structuring: ElementTui doesn’t automatically loop or manage state for you beyond what run_loop provides. If you want periodic updates (e.g. a clock tick), you supply a timeout: option to run_loop (as shown, they used timeout: 1000 ms) so that poll_event will return control every second even with no input. Your callback then runs and can, for example, redraw the UI (perhaps showing an updated timestamp or animating something) and return {:cont, state} to continue. If no update is needed, you still call present() with the same content or simply return {:cont, state} again. In other words, ElementTui gives a flexible, low-level control over the render loop, akin to writing an interactive REPL or game loop yourself.
+
+Because ElementTui is not juggling multiple processes, state management is manual. The state you pass to run_loop (and return in {:cont, state}) is where you accumulate any interactive state (for example, which item is selected, or data loaded from elsewhere). The library does not enforce an architecture for this – it’s up to you to update that state and use it when constructing the UI. Building higher-level components on ElementTui is accomplished by pure functions and perhaps some provided abstractions. The library itself includes basic layout components (boxes, flex, fill, etc.) and a separate “components” library is mentioned for more complex widgets
+preview.hex.pm
+. Those higher components are likely just functions that produce element trees (for example, a tab panel component might take the active tab and content for each tab, and return an hbox of tab labels with the active one highlighted, plus the content area). Since there is no component lifecycle or process isolation, these are static compositions – you call a component function each frame to get what to render, and you manage its state (like current tab index) in your main loop’s state. This is a simpler model than Raxol’s or Ratatouille’s Elm-like approach, but it fits well with ElementTui’s minimalism. It’s quite straightforward to get a TUI running: in a few lines you set up run_loop with a callback, and then you directly call drawing functions in response to events
+preview.hex.pm
+. The trade-off is that you, the developer, ensure the logic is organized; ElementTui won’t provide a built-in dispatcher or separation of concerns – it’s more like “raw materials” for a TUI.
+
+To summarize the comparisons: All three libraries interface with the terminal through native code (NIF) for efficiency. Raxol and ElementTui both leverage Termbox2 (supporting truecolor, etc.) and even include similar C NIF implementations for it, whereas Ratatouille uses the older Termbox via the ex_termbox NIF (which it updated to fix some poll bug
+GitHub
+). In terms of rendering, each uses Termbox’s off-screen buffer to batch updates and then present to draw – avoiding per-cell flicker. Raxol and Ratatouille abstract this with their own buffering (Raxol’s ScreenBuffer, Ratatouille’s Canvas), while ElementTui leans on Termbox2’s internal buffer directly. For architecture, Raxol and Ratatouille adopt OTP conventions: Raxol splits responsibilities into many GenServers (driver, dispatcher, renderer, etc.) under supervisors
+GitHub
+, and Ratatouille has a supervisor that launches a Window GenServer and an EventManager alongside the main loop
+GitHub
+. This means in those libraries, state is maintained in processes (e.g. Raxol’s Dispatcher holds the app state, Ratatouille’s Runtime task holds the model) and events are delivered via message passing (Termbox events come in as messages – Raxol’s driver sends to dispatcher, Ratatouille’s EventManager broadcasts to the runtime)
+GitHub
+. ElementTui, by contrast, runs everything on one thread of execution: it pulls an event and immediately calls your handler, so no message queue is involved – the event is just a function argument. There is also no persistent process state: you carry state forward yourself in recursive calls. This can make ElementTui simpler for small apps or embedding a TUI loop in an existing process, but for larger apps one might need to design a manual event routing if, say, multiple parts of the UI need to handle different keys. (In Raxol/Ratatouille, you could register handlers or pattern-match in update functions to direct events to the right part of state.)
+
+Finally, all three provide a way to build UI components on top of the raw terminal drawing. Ratatouille and ElementTui take a declarative UI approach – you compose interface elements (panels, tables, text, etc.) in a tree. For example, Ratatouille’s DSL is very HTML-like (you can literally nest calls like table_row do ... end inside a table inside a panel), and ElementTui’s API is similar in spirit, just using functions (Element.hbox([...]), Element.text("txt"), etc.)
+preview.hex.pm
+. Raxol’s approach is also declarative: the user defines a view function that returns a nested structure of UI components (it has layout engines and even a theming system to style components)
+GitHub
+. Under the hood, Raxol differs by offering more infrastructure – e.g. a plug-in system to transform the rendered cells (perhaps for special effects or alternative outputs), and a CQRS/dispatcher pattern for commands and events. This makes Raxol feel more like a full-fledged application framework (akin to Phoenix LiveView but for TUI). Ratatouille targets a middle ground: you get an Elm-like architecture (pure functional view, a clear separation of state and UI, and a single update loop) without having to build that yourself. ElementTui is the most bare-bones: it’s essentially a thin layer over Termbox2 that helps with layout and input decoding, but leaves architecture to you. It even encourages extension via an external components library (for things like tabbed interfaces, charts, etc.) rather than baking those into the core
+preview.hex.pm
+.
+
+In conclusion, each project integrates with the Erlang Termbox NIF interface to achieve fast, flicker-free terminal drawing, but they differ in how they manage the rendering loop and state. Raxol and Ratatouille run the terminal UI inside supervised processes (GenServers/Tasks) – the former extremely structured (multiple processes in a tree) and the latter more streamlined (one main loop plus I/O helpers) – whereas ElementTui opts for an explicit loop in user space, no extra processes required. All three render by writing to Termbox’s off-screen buffer then presenting it (e.g. setting each cell’s characters/colors and calling a flush), and they all allow building richer UI components on top of these primitives. Raxol provides a high-level framework (with an event dispatcher and pluggable render pipeline) to build complex interactive components, Ratatouille offers a declarative DSL and Elm-like update cycle to keep components in sync with application state, and ElementTui provides fundamental layout primitives for the developer to assemble and control directly. In essence, they solve the same problem – creating terminal UIs – with increasing levels of abstraction: ElementTui is “minimal glue” to Termbox2
+preview.hex.pm
+, Ratatouille is a declarative UI kit on Termbox with a managed event loop, and Raxol is an architected TUI framework that leverages Termbox2 at the core but adds layers of OTP patterns and architectural conveniences to organize a complex app. Each approach has its merits, from ElementTui’s simplicity (full control over the loop) to Raxol’s robustness (structured, supervised processes and a modular design), all made possible by the efficient native Termbox integration under the hood
+GitHub
+.
