@@ -132,5 +132,5 @@ static ErlNifFunc nif_funcs[] = {
   {"poll_event", 0, nif_poll_event, ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 
-ERL_NIF_INIT(Elixir.TermDemo, nif_funcs, load, NULL, NULL, NULL)
+ERL_NIF_INIT(Elixir.Termbox2.Native, nif_funcs, load, NULL, NULL, NULL)
 
