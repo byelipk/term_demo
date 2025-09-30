@@ -31,8 +31,9 @@ defmodule TermDemo do
       :ok = present()
 
       case poll_event() do
-        {:ok, %{type: :key}} -> :ok
-        _ -> :ok
+        evt ->
+          dbg(evt)
+          :ok
       end
     after
       :ok = shutdown()
