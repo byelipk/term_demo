@@ -7,66 +7,44 @@ defmodule TermDemo do
   defdelegate present(), to: Native
   defdelegate width(), to: Native
   defdelegate height(), to: Native
-  defdelegate peek_event(timeout_ms), to: Native
   defdelegate poll_event(), to: Native
 
-  def run(message \\ "Hello, World!") do
+  @default_message "Hello, World!"
+
+  def demo(message \\ @default_message) do
     try do
       :ok = init()
       :ok = clear()
 
-      state = %{
-        message: String.to_charlist(message),
-        width: width(),
-        height: height()
-      }
+      w = width()
+      h = height()
+      message_chars = String.to_charlist(message)
 
-      loop(state)
+      buffer =
+        ScreenBuffer.new(w, h)
+        |> render_frame(w, h, message_chars)
+
+      case ScreenBuffer.blit(buffer) do
+        :ok -> :ok
+        {:error, code} -> IO.warn("term_demo: failed to blit buffer (error #{code})")
+      end
+
+      :ok = present()
+      await_key()
     after
       :ok = shutdown()
     end
   end
 
-  defp loop(state) do
-    _ = render(state)
+  defp render_frame(buffer, width, height, message_chars) do
+    case place_box(width, height, message_chars) do
+      {:ok, {box_x, box_y}} ->
+        dims = {box_x, box_y, box_width(message_chars), box_height()}
+        draw_box(buffer, dims, message_chars)
 
-    case poll_event() do
-      {:ok, %{type: :key}} ->
-        :ok
-
-      {:ok, %{type: :resize, w: w, h: h}} ->
-        loop(%{state | width: w, height: h})
-
-      {:ok, _other} ->
-        loop(state)
-
-      {:error, _reason} ->
-        :ok
+      :too_small ->
+        draw_plain_text(buffer, width, height, message_chars)
     end
-  end
-
-  defp render(%{message: message_chars, width: width, height: height} = state) do
-    buffer = ScreenBuffer.new(width, height)
-
-    buffer =
-      case place_box(width, height, message_chars) do
-        {:ok, {box_x, box_y}} ->
-          dims = {box_x, box_y, box_width(message_chars), box_height()}
-          draw_box(buffer, dims, message_chars)
-
-        :too_small ->
-          draw_plain_text(buffer, width, height, message_chars)
-      end
-
-    :ok = clear()
-
-    case ScreenBuffer.blit(buffer) do
-      :ok -> :ok
-      {:error, code} -> IO.warn("term_demo: failed to blit buffer (error #{code})")
-    end
-
-    :ok = present()
-    state
   end
 
   defp place_box(width, height, message_chars) do
@@ -155,6 +133,14 @@ defmodule TermDemo do
       end)
 
     buffer
+  end
+
+  defp await_key do
+    case poll_event() do
+      {:ok, %{type: :key}} -> :ok
+      {:ok, _other} -> await_key()
+      {:error, _} -> :ok
+    end
   end
 
   defp box_width(message_chars), do: length(message_chars) + 4
